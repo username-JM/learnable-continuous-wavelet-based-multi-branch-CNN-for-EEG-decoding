@@ -3,87 +3,77 @@ import torch
 import torch.nn.functional as F
 import math
 
-
 class JMNet(nn.Module):
     def __init__(self, shape):
+        # shape = [batch, 1, # electrodes, # time points]
         super(JMNet, self).__init__()
         self.first_freq = 1
         self.last_freq = 40
         self.filter_size = 150
         self.reduction_ratio = 4
-        self.freq_len = [[0, 8], [8, 16], [16, 24], [24, 32], [32, 40]]
-        self.filter_n = (self.freq_len[0][1] - self.freq_len[0][0])
-        self.num_branch = len(self.freq_len)
-        self.num_ch = shape[2]
+        # frequency range of multiple branches
+        self.len_freq = [[0, 8], [8, 16], [16, 24], [24, 32], [32, 40]]
+        # number of learnable wavelet kernels
+        self.n_filter = (self.len_freq[0][1] - self.len_freq[0][0])
+        self.n_branch = len(self.len_freq)
+        self.n_ch = shape[2]
         self.C1 = 32
         self.C2 = 64
         self.t1 = 15
         self.t2 = 15
-        self.cnn_list = nn.ModuleList()
-        self.wkn_list = nn.ModuleList()
-        self.freq_selection = torch.tensor(1)
-        self.omega = torch.tensor(1)
+        self.sstfb_list = nn.ModuleList()
+        self.cwconv_list = nn.ModuleList()
 
-        self.Conv_1 = nn.Sequential(
-            nn.Conv2d(self.C1*self.num_branch, self.C2, kernel_size=(1, self.t2), stride=(1, 2)),
+        # Multi-branch pipeline
+        for i in range(self.n_branch):
+            self.cwconv_list.append(CWConv(self.len_freq[i][0] + 1, self.len_freq[i][1], self.n_filter, self.filter_size, 1))
+            self.sstfb_list.append(ConvBlock(self.n_ch, self.C1, self.C2, self.n_filter))
+
+        # Global-branch
+        self.global_branch = nn.Sequential(
+            nn.Conv2d(self.C1 * self.n_branch, self.C2, kernel_size=(1, self.t2), stride=(1, 2)),
             nn.BatchNorm2d(self.C2),
             nn.LeakyReLU(),
             nn.MaxPool2d((1, 4)),
-            nn.Dropout(0.25)
+            nn.Dropout(0.25),
+            SEBlock(self.C2, reduction_ratio=8)
         )
-        for i in range(self.num_branch):
-            self.wkn_list.append(CWConv(self.freq_len[i][0]+1, self.freq_len[i][1], self.filter_n, self.filter_size, 1))
-            self.cnn_list.append(ConvBlock(self.num_ch, self.C1, self.C2, self.filter_n))
+
+        # Classifier
         self.linear = nn.Sequential(
-            nn.Linear(in_features=448 * self.num_branch + 448, out_features=4)
+            nn.Linear(in_features=448 * self.n_branch + 448, out_features=4)
         )
-
-    def get_wkn_info(self):
-        print("\n==== [WKN INFO] ====\n")
-        freq = []
-        omega = []
-        print("=====> Frequency\n")
-        for i in range(self.num_branch):
-            print(f"branch{i}:     ", end="")
-            freq.append(self.wkn_list[i].get_freq_info())
-            print(freq[-1])
-        print("\n=====> Omega\n")
-        for i in range(self.num_branch):
-            print(f"branch{i}:     ", end="")
-            omega.append(self.wkn_list[i].get_omega_info())
-            print(omega[-1])
-        print("\n")
-        self.freq_selection = torch.stack(freq, dim=0)
-        self.omega = torch.stack(omega, dim=0)
-
 
     def forward(self, x):
         batch_size, _, ch, tp = x.shape
         out = torch.reshape(x, (batch_size * ch, 1, -1))
         low_feat = []
         high_feat = []
-        wt_img = []
-        for i in range(0, self.num_branch):
-            tmp = self.wkn_list[i](out)
-            tmp = tmp.view(batch_size, ch, self.filter_n, -1)  # 36,22,filter_n,time_n
-            wt_img.append(tmp)
-            tmp, o, score = self.cnn_list[i](tmp)
-            low_feat.append(o[0])
-            high_feat.append(tmp)
 
-        # low level global feature embedding
-        low_out = torch.cat(low_feat, dim=1)
-        low_out = self.Conv_1(low_out)
-        low_out, _ = self.se(low_out)
+        # multi-branch feature extraction
+        for i in range(0, self.n_branch):
+            # CWConv
+            tmp = self.cwconv_list[i](out)
+            tmp = tmp.view(batch_size, ch, self.n_filter, -1)
+            # SSTFB
+            high, low, _ = self.sstfb_list[i](tmp)
+            low_feat.append(low[0])
+            high_feat.append(high)
 
-        # high level global feature embedding
-        high_out = torch.cat(high_feat, dim=1)
+        # global branch feature extraction
+        global_feat = torch.cat(low_feat, dim=1)
+        global_feat = self.global_branch(global_feat)
 
-        out = torch.cat([low_out, high_out], dim=1)
+        # high-level local features
+        local_feat = torch.cat(high_feat, dim=1)
+
+        # local-global feature fusion
+        out = torch.cat([local_feat, global_feat], dim=1)
         out = out.view(batch_size, -1)
-        out = self.linear(out)
 
-        return out, wt_img
+        # Classification
+        out = self.linear(out)
+        return out
 
 
 class ConvBlock(nn.Module):
@@ -122,28 +112,6 @@ class ConvBlock(nn.Module):
         return out, [low, None], s1
 
 
-class Conv(nn.Module):
-    def __init__(self, in_ch, out_ch, kernel, stride=(1, 1), padding=(0, 0), pooling=(1, 1), attention=True):
-        super(Conv, self).__init__()
-        self.in_dim = in_ch
-        self.out_dim = out_ch
-        self.n_freq = 15
-        self.att = attention
-
-        self.Conv_0 = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, kernel_size=kernel, stride=(1, 2)),
-            nn.BatchNorm2d(out_ch),
-            nn.LeakyReLU(),
-            nn.MaxPool2d((1, 8)),
-            nn.Dropout(0.25)
-        )
-        self.attention = SEBlock(self.out_ch)
-
-    def forward(self, x):
-        out = self.Conv_0(x)
-        return self.attention(out) if self.att else out
-
-
 class CWConv(nn.Module):
     def __init__(self, first_freq, last_freq, filter_n, kernel_size, in_channels=1):
         super(CWConv, self).__init__()
@@ -157,12 +125,6 @@ class CWConv(nn.Module):
         self.omega = 5.15
         self.a_ = nn.parameter.Parameter(torch.tensor([float(x/100) for x in range(first_freq, last_freq+1)]).view(-1, 1))
         self.b_ = torch.tensor(self.omega)
-
-    def get_freq_info(self):
-        return torch.clamp(torch.tensor(list(map(lambda x: float(x * 100.0), self.a_))), min=1e-7)
-
-    def get_omega_info(self):
-        return torch.tensor(self.b_)
 
     def forward(self, waveforms):
         device = waveforms.device
@@ -192,6 +154,7 @@ class SEBlock(nn.Module):
         )
         self.relu = nn.ReLU()
         self.sigmoid = nn.Sigmoid()
+
     def forward(self, x):
         ''' Channel attention '''
         avgOut = self.globalAvgPool(x)
